@@ -135,6 +135,100 @@ def _clean_latex(text: str) -> str:
     return text.strip()
 
 
+# ── Invoice Number Extraction ────────────────────────────────────────────────────
+
+def extract_invoice_number(text: str) -> str | None:
+    """
+    Run heuristic regex patterns on OCR text to find an invoice number.
+    Handles OCR noise: extra spaces between letters, slight misspellings.
+    """
+    # Step 1: Normalize the text for better matching
+    # Remove spaces between individual letters: "I N V O I C E" → "INVOICE"
+    normalized = _collapse_spaced_letters(text)
+    logger.info(f"   🔎 Searching for invoice # in: {repr(normalized[:200])}")
+
+    # Step 2: Try patterns on both original and normalized text
+    for search_text in [normalized, text]:
+        result = _try_patterns(search_text)
+        if result:
+            return result
+
+    # Step 3: Last resort — just find any number that follows invoice-like words
+    fallback = re.search(
+        r'(?:inv(?:oice)?|receipt|bill|slip)\s*(?:no\.?|number|num|#)?\s*[:\-]?\s*([A-Za-z0-9/\-_]{3,})',
+        normalized, re.IGNORECASE
+    )
+    if fallback:
+        extracted = fallback.group(1)
+        if re.search(r'\d', extracted):
+            logger.info(f"   🔢 Invoice number found via fallback: {extracted}")
+            return extracted
+
+    return None
+
+
+def _collapse_spaced_letters(text: str) -> str:
+    """
+    Collapse single-letter sequences with spaces: "I N V O I C E" → "INVOICE"
+    Also handles "I N V 1 2 3" → "INV 123"
+    """
+    result = text
+    # Find sequences of single chars separated by spaces (3+ in a row)
+    # e.g. "I N V O I C E" or "1 2 3 4 5"
+    def collapse(m):
+        chars = m.group(0).replace(' ', '')
+        return chars
+
+    # Match: word-boundary, then (single-char space)+ single-char, word-boundary
+    # At least 3 single chars in a row
+    result = re.sub(r'\b([A-Za-z0-9] ){2,}[A-Za-z0-9]\b', collapse, result)
+    return result
+
+
+def _try_patterns(text: str) -> str | None:
+    """Try all invoice number patterns against text."""
+    patterns = [
+        (r"INV#\s*:?\s*([A-Za-z0-9/\-]+)", "INV#"),
+        (r"INV:\s*([^\s]+)", "INV:"),
+        (r"INV-NO\.\s*([^\s]+)", "INV-NO"),
+        (r"INV\s*\.?\s*NO\.?\s*[:\-]?\s*([A-Za-z0-9/\-]+)", "INV NO"),
+        (r"INVOICE\s*\.?\s*NO\.?\s*[:\-]?\s*([A-Za-z0-9/\-_]+)", "INVOICE NO"),
+        (r"INVOICE\s*\.?\s*NUMBER\s*[:\-]?\s*([A-Za-z0-9/\-_]+)", "INVOICE NUMBER"),
+        (r"INVOICE\s*#\s*:?[\s]*([A-Za-z0-9/\-]+)", "INVOICE#"),
+        (r"INVOICE\s*[:\-]\s*([A-Za-z0-9/\-_]+)", "INVOICE:"),
+        (r"INVOICE\s+([A-Za-z0-9/\-_]+\d[A-Za-z0-9/\-_]*)", "INVOICE <num>"),
+        (r"SLIP\s*(?:NO\.?|NUMBER)?\s*[^A-Za-z0-9]*\s*([A-Za-z0-9/\-]+)", "SLIP"),
+        (r"RECEIPT\s*(?:NO\.?|NUMBER)?\s*[:\-]?\s*([A-Za-z0-9/\-]+)", "RECEIPT"),
+        (r"BILL\s*(?:NO\.?|NUMBER)?\s*[:\-]?\s*([A-Za-z0-9/\-]+)", "BILL"),
+        (r"CB#\s*:\s*([A-Za-z0-9/\-]+)", "CB#"),
+        (r"C/N\s*NO\s*[:\-]?\s*([A-Za-z0-9/\-]+)", "C/N NO"),
+        (r"TRANSACTION\s*(?:NO\.?|NUMBER)?\s*[:\-]?\s*([A-Za-z0-9/\-]+)", "TRANSACTION"),
+        (r"TRN\s*[:\-]?\s*([A-Za-z0-9/\-]+)", "TRN"),
+        (r"RCPT#\s*:\s*([A-Za-z0-9]+)", "RCPT"),
+    ]
+
+    for pattern, name in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            extracted = match.group(1).strip()
+            # Must be > 2 chars
+            if len(extracted) <= 2:
+                continue
+            # Must contain at least one digit
+            if not re.search(r"\d", extracted):
+                continue
+            # Skip dates (MM/DD/YYYY)
+            if extracted.count("/") == 2 and re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", extracted):
+                continue
+            # Take first value if comma-separated
+            if "," in extracted:
+                extracted = extracted.split(",")[0]
+            logger.info(f"   🔢 Invoice number found via '{name}': {extracted}")
+            return extracted
+
+    return None
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────────
 
 def _pil_to_png_bytes(image: Image.Image) -> bytes:
@@ -200,11 +294,15 @@ async def ocr_endpoint(
     raw, cleaned = run_ocr(pil_image)
     elapsed_ms = (time.time() - start) * 1000
 
+    invoice_number = extract_invoice_number(cleaned)
+
     logger.info(f"   📄 Raw output:     {repr(raw[:150])}")
     logger.info(f"   ✅ Cleaned output:  {repr(cleaned[:150])}")
+    if invoice_number:
+        logger.info(f"   🔢 Invoice #:      {invoice_number}")
     logger.info(f"   ⏱️  Completed in {elapsed_ms:.0f}ms")
 
-    return {"text": cleaned, "processing_time_ms": round(elapsed_ms)}
+    return {"text": cleaned, "invoice_number": invoice_number, "processing_time_ms": round(elapsed_ms)}
 
 
 @app.post("/ocr/stream")
@@ -238,12 +336,18 @@ async def ocr_stream_endpoint(
         logger.info("   🔍 Running LightOnOCR...")
         raw, cleaned, elapsed_ms = stream_ocr_generator(ocr_input)
 
+        invoice_number = extract_invoice_number(cleaned)
+
         logger.info(f"   📄 Raw output:     {repr(raw[:150])}")
         logger.info(f"   ✅ Cleaned output:  {repr(cleaned[:150])}")
+        if invoice_number:
+            logger.info(f"   🔢 Invoice #:      {invoice_number}")
         logger.info(f"   ⏱️  Completed in {elapsed_ms:.0f}ms")
 
         if cleaned:
             yield f"data: {json.dumps({'type': 'token', 'text': cleaned})}\n\n"
+        if invoice_number:
+            yield f"data: {json.dumps({'type': 'invoice_number', 'invoice_number': invoice_number})}\n\n"
         yield f"data: {json.dumps({'type': 'done', 'processing_time_ms': round(elapsed_ms)})}\n\n"
 
     return StreamingResponse(
